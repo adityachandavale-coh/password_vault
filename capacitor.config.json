@@ -1,0 +1,7 @@
+{
+  "appId": "local.homehub.app",
+  "appName": "HomeHub",
+  "webDir": "dist",
+  "server": { "hostname": "localhost" }
+}
+

@@ -1,0 +1,8 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+python-multipart>=0.0.20,<1
+argon2-cffi>=23.1,<26
+cryptography>=44,<47
+httpx>=0.28,<1
+PyMuPDF>=1.25,<2
+tzdata>=2026.1

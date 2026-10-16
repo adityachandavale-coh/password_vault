@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    env_file: .env
+    environment:
+      HOMEHUB_DATA_DIR: /app/data
+      HOMEHUB_OLLAMA_URL: http://ollama:11434
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./data:/app/data
+      - ./rclone:/root/.config/rclone
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+volumes:
+  ollama_models:
