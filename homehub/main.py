@@ -1,27 +1,28 @@
-import asyncio
 import csv
 import io
 import mimetypes
 import json
+import re
 import os
 import shutil
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import httpx
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from .config import DATA_DIR, OLLAMA_MODEL, OLLAMA_URL, REMOTES, TIMEZONE, REMINDER_HOUR
-from .db import connection, initialize, row_dict
-from .security import (PASSWORD_HASHER, issue_session, require_same_origin, require_user,
-                       revoke_session, setup_token, verify_setup_token)
+from .config import OLLAMA_MODEL, OLLAMA_URL, REMOTES, TIMEZONE, REMINDER_HOUR
+from .db import connection, initialize
+from .security import (PASSWORD_HASHER, issue_session, purge_expired_sessions,
+                       require_same_origin, require_user, revoke_session, setup_token,
+                       verify_setup_token)
 from .services import (extract_document, ics_for_reminder, interpret_prompt, list_cloud_files,
                        make_reminder, read_cloud_file, read_document, save_document,
                        send_due_emails, sync_document, today, valid_date)
@@ -81,7 +82,12 @@ class PromptInput(BaseModel):
     text: str = Field(min_length=1, max_length=1500)
 
 
+WORKER_INTERVAL = 30
+RETRY_INTERVAL = 600
+
+
 def _worker(stop: threading.Event) -> None:
+    last_retry_sweep = 0.0
     while not stop.is_set():
         try:
             with connection() as conn:
@@ -97,7 +103,8 @@ def _worker(stop: threading.Event) -> None:
                     sync_document(row['id'])
                 except Exception:
                     pass
-            if any(REMOTES.values()):
+            if any(REMOTES.values()) and time.monotonic() - last_retry_sweep >= RETRY_INTERVAL:
+                last_retry_sweep = time.monotonic()
                 with connection() as conn:
                     rows = conn.execute("SELECT id,cloud_json FROM documents WHERE processing_status!='pending' ORDER BY created_at DESC LIMIT 50").fetchall()
                 for row in rows:
@@ -111,7 +118,7 @@ def _worker(stop: threading.Event) -> None:
             send_due_emails()
         except Exception:
             pass
-        stop.wait(30)
+        stop.wait(WORKER_INTERVAL)
 
 
 @asynccontextmanager
@@ -202,10 +209,11 @@ def login(body: Credentials, request: Request, response: Response):
         raise HTTPException(401, 'Incorrect email or password')
     try:
         PASSWORD_HASHER.verify(user['password_hash'], body.password)
-    except VerifyMismatchError:
+    except (VerificationError, InvalidHashError):
         record_login_attempt(address, False)
         raise HTTPException(401, 'Incorrect email or password')
     record_login_attempt(address, True)
+    purge_expired_sessions()
     token = issue_session()
     response.set_cookie('homehub_session', token, httponly=True, secure=request.url.scheme == 'https',
                         samesite='strict', max_age=604800)
@@ -310,8 +318,24 @@ def cloud_file(provider: str, path: str, _=Depends(require_user)):
     except (ValueError, OSError, RuntimeError) as error:
         raise HTTPException(400, str(error))
     mime = mimetypes.guess_type(path)[0] or 'application/octet-stream'
-    return Response(data, media_type=mime, headers={
-        'Content-Disposition': 'inline; filename="cloud-file"'})
+    name = Path(path).name or 'cloud-file'
+    return Response(data, media_type=mime, headers=_disposition(mime, name))
+
+
+PREVIEWABLE = {'application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+               'text/plain'}
+
+
+def _disposition(mime: str, filename: str) -> dict[str, str]:
+    """Render known-safe types in the browser; download anything else.
+
+    An HTML or SVG file in a synced cloud folder would otherwise run as
+    same-origin content. The name is reduced to header-safe characters so a
+    remote filename cannot inject a header.
+    """
+    kind = 'inline' if mime.split(';')[0].strip() in PREVIEWABLE else 'attachment'
+    safe = re.sub(r'[^A-Za-z0-9._ -]', '_', filename).strip(' .')[:100] or 'file'
+    return {'Content-Disposition': f'{kind}; filename="{safe}"'}
 
 
 @app.get('/api/documents/{document_id}/file')
@@ -320,8 +344,12 @@ def document_file(document_id: str, _=Depends(require_user)):
         row = conn.execute('SELECT mime_type,name FROM documents WHERE id=?', (document_id,)).fetchone()
     if not row:
         raise HTTPException(404, 'Document not found')
-    return Response(read_document(document_id), media_type=row['mime_type'], headers={
-        'Content-Disposition': 'inline; filename="document"'})
+    try:
+        data = read_document(document_id)
+    except (FileNotFoundError, OSError):
+        raise HTTPException(410, 'The encrypted copy of this document is missing')
+    return Response(data, media_type=row['mime_type'],
+                    headers=_disposition(row['mime_type'], 'document'))
 
 
 @app.post('/api/documents/{document_id}/review')
@@ -484,8 +512,8 @@ def reports(_=Depends(require_user)):
             WHERE expiry_date IS NOT NULL ORDER BY expiry_date LIMIT 50''').fetchall()
         docs_missing_expiry = conn.execute('SELECT COUNT(*) count FROM documents WHERE expiry_date IS NULL').fetchone()['count']
         reminder_summary = conn.execute('''SELECT COUNT(*) total,
-            SUM(CASE WHEN event_date < ? THEN 1 ELSE 0 END) overdue,
-            SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failed
+            COALESCE(SUM(CASE WHEN event_date < ? THEN 1 ELSE 0 END), 0) overdue,
+            COALESCE(SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END), 0) failed
             FROM reminders''', (today(),)).fetchone()
         vault_count = conn.execute('SELECT COUNT(*) count FROM vault_items').fetchone()['count']
     return {'expense_by_category': [dict(row) for row in by_category],

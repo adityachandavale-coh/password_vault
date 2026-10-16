@@ -1,12 +1,13 @@
-param([string]$Bind = '0.0.0.0', [int]$Port = 8443)
+# Start HomeHub on Windows. Host, port, and certificate directory come from
+# .env; anything passed here is forwarded to `python -m homehub`.
+param([string]$Bind = '0.0.0.0', [Parameter(ValueFromRemainingArguments = $true)] $Extra)
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
-if (-not (Test-Path '.venv\Scripts\python.exe')) {
+$python = '.venv\Scripts\python.exe'
+if (-not (Test-Path $python)) {
     python -m venv .venv
-    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+    & $python -m pip install --upgrade pip
+    & $python -m pip install -r requirements.txt
 }
-if (-not (Test-Path 'data\certs\server.crt') -or -not (Test-Path 'data\certs\server.key')) {
-    throw 'Generate data/certs/server.crt and server.key with scripts/make_cert.py first.'
-}
-& .\.venv\Scripts\python.exe -m uvicorn homehub.main:app --host $Bind --port $Port --ssl-certfile data/certs/server.crt --ssl-keyfile data/certs/server.key
-
+& $python -m homehub --host $Bind @Extra
+exit $LASTEXITCODE
