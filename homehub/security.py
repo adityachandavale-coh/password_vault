@@ -1,10 +1,8 @@
-import base64
 import hashlib
 import hmac
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import HTTPException, Request
@@ -60,6 +58,12 @@ def issue_session() -> str:
     with connection() as conn:
         conn.execute('INSERT INTO sessions VALUES (?, 1, ?)', (digest, expiry))
     return token
+
+
+def purge_expired_sessions() -> None:
+    with connection() as conn:
+        conn.execute('DELETE FROM sessions WHERE expires_at < ?',
+                     (datetime.now(timezone.utc).isoformat(),))
 
 
 def revoke_session(token: str | None) -> None:

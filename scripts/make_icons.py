@@ -1,5 +1,8 @@
+"""Regenerate the web app icons. Needs Pillow: pip install Pillow"""
 from pathlib import Path
 from PIL import Image, ImageDraw
+
+PUBLIC = Path(__file__).resolve().parent.parent / 'public'
 
 
 for size in (192, 512):
@@ -17,4 +20,4 @@ for size in (192, 512):
     draw.line((left, top, left, bottom), fill=color, width=stroke)
     draw.line((right, top, right, bottom), fill=color, width=stroke)
     draw.line((left, size // 2, right, size // 2), fill=color, width=stroke)
-    image.save(Path('public') / f'icon-{size}.png')
+    image.save(PUBLIC / f'icon-{size}.png')

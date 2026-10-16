@@ -1,11 +1,19 @@
 #!/usr/bin/env sh
+# Start HomeHub on macOS or Linux. Host, port, and certificate directory come
+# from .env; anything passed here is forwarded to `python -m homehub`.
 set -eu
-cd "$(dirname "$0")/.."
-if [ ! -d .venv ]; then
-  python3 -m venv .venv
-  .venv/bin/python -m pip install -r requirements.txt
-fi
-test -f data/certs/server.crt
-test -f data/certs/server.key
-exec .venv/bin/python -m uvicorn homehub.main:app --host 0.0.0.0 --port 8443 --ssl-certfile data/certs/server.crt --ssl-keyfile data/certs/server.key
+cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
+PYTHON=.venv/bin/python
+if [ ! -x "$PYTHON" ]; then
+  BOOTSTRAP=$(command -v python3 || command -v python || true)
+  if [ -z "$BOOTSTRAP" ]; then
+    echo "Python 3.12 or newer is required but was not found on PATH." >&2
+    exit 1
+  fi
+  "$BOOTSTRAP" -m venv .venv
+  "$PYTHON" -m pip install --upgrade pip
+  "$PYTHON" -m pip install -r requirements.txt
+fi
+
+exec "$PYTHON" -m homehub --host "${HOMEHUB_BIND:-0.0.0.0}" "$@"

@@ -2,7 +2,6 @@ import base64
 import json
 import os
 import re
-import shutil
 import smtplib
 import subprocess
 import tempfile
@@ -45,7 +44,7 @@ def make_reminder(title: str, event_date: str, lead_days: int = 30,
 
 def encrypted_document_path(document_id: str) -> Path:
     folder = DATA_DIR / 'documents'
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
     return folder / f'{document_id}.bin'
 
 
@@ -214,6 +213,14 @@ def extract_document(document_id: str) -> dict:
     return result
 
 
+def _rclone(arguments: list[str], **kwargs):
+    """Run rclone, turning a missing binary into a message the UI can show."""
+    try:
+        return subprocess.run(['rclone', *arguments], **kwargs)
+    except FileNotFoundError:
+        raise RuntimeError("rclone is not installed or not on this host's PATH")
+
+
 def _rclone_target(remote: str, category: str, filename: str) -> str:
     if not re.fullmatch(r'[A-Za-z0-9_-]+', remote):
         raise ValueError('Invalid rclone remote name')
@@ -239,8 +246,8 @@ def sync_document(document_id: str) -> dict:
                 continue
             target = _rclone_target(remote, row['category'], destination_name)
             try:
-                completed = subprocess.run(['rclone', 'copyto', str(source), target],
-                                           capture_output=True, text=True, timeout=180)
+                completed = _rclone(['copyto', str(source), target],
+                                   capture_output=True, text=True, timeout=180)
                 if completed.returncode:
                     raise RuntimeError(completed.stderr[-250:] or 'rclone upload failed')
                 results[provider] = {'status': 'synced', 'path': target}
@@ -267,8 +274,8 @@ def safe_cloud_path(path: str) -> str:
 
 def list_cloud_files(provider: str) -> list[dict]:
     target = cloud_root(provider)
-    result = subprocess.run(['rclone', 'lsjson', target, '--recursive', '--max-depth', '5'],
-                            capture_output=True, text=True, timeout=60)
+    result = _rclone(['lsjson', target, '--recursive', '--max-depth', '5'],
+                     capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr[-250:] or 'Cloud listing failed')
     files = json.loads(result.stdout)
@@ -280,17 +287,36 @@ def list_cloud_files(provider: str) -> list[dict]:
 def read_cloud_file(provider: str, path: str) -> bytes:
     relative = safe_cloud_path(path)
     target = f'{cloud_root(provider)}/{relative}'
-    stat = subprocess.run(['rclone', 'lsjson', target, '--stat'],
-                          capture_output=True, text=True, timeout=30)
+    stat = _rclone(['lsjson', target, '--stat'],
+                   capture_output=True, text=True, timeout=30)
     if stat.returncode:
         raise FileNotFoundError(path)
     size = json.loads(stat.stdout).get('Size', 0)
     if size > 20 * 1024 * 1024:
         raise ValueError('Cloud preview is limited to 20 MB')
-    result = subprocess.run(['rclone', 'cat', target], capture_output=True, timeout=90)
+    result = _rclone(['cat', target], capture_output=True, timeout=90)
     if result.returncode or len(result.stdout) > 20 * 1024 * 1024:
         raise RuntimeError('Could not open cloud file')
     return result.stdout
+
+
+# A reminder whose delivery failed is retried on this cadence instead of on
+# every pass of the background worker.
+RETRY_BACKOFF_SECONDS = 3600
+
+
+def _send_message(host: str, message: EmailMessage) -> None:
+    port = int(os.getenv('HOMEHUB_SMTP_PORT', '587'))
+    user = os.getenv('HOMEHUB_SMTP_USER', '')
+    password = os.getenv('HOMEHUB_SMTP_PASSWORD', '')
+    # Port 465 is implicit TLS; STARTTLS on it fails before the greeting.
+    opener = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+    with opener(host, port, timeout=20) as smtp:
+        if port != 465:
+            smtp.starttls()
+        if user:
+            smtp.login(user, password)
+        smtp.send_message(message)
 
 
 def send_due_emails() -> int:
@@ -301,10 +327,13 @@ def send_due_emails() -> int:
     recipient = os.getenv('HOMEHUB_REMINDER_TO', '')
     if not host or not sender or not recipient:
         return 0
+    retry_after = (datetime.now(timezone.utc) - timedelta(seconds=RETRY_BACKOFF_SECONDS)).isoformat()
     with connection() as conn:
         rows = conn.execute('''SELECT * FROM reminders WHERE send_on<=? AND event_date>=?
-            AND sent_at IS NULL AND email_enabled=1 ORDER BY send_on LIMIT 20''',
-            (today(), today())).fetchall()
+            AND sent_at IS NULL AND email_enabled=1
+            AND (last_attempt_at IS NULL OR last_attempt_at<?)
+            ORDER BY send_on LIMIT 20''',
+            (today(), today(), retry_after)).fetchall()
     sent = 0
     for row in rows:
         message = EmailMessage()
@@ -312,21 +341,17 @@ def send_due_emails() -> int:
         message['From'] = sender
         message['To'] = recipient
         message.set_content(f'{row["title"]}\nDate: {row["event_date"]}\n')
+        attempted_at = datetime.now(timezone.utc).isoformat()
         try:
-            with smtplib.SMTP(host, int(os.getenv('HOMEHUB_SMTP_PORT', '587')), timeout=20) as smtp:
-                smtp.starttls()
-                user = os.getenv('HOMEHUB_SMTP_USER', '')
-                password = os.getenv('HOMEHUB_SMTP_PASSWORD', '')
-                if user:
-                    smtp.login(user, password)
-                smtp.send_message(message)
+            _send_message(host, message)
             with connection() as conn:
-                conn.execute('UPDATE reminders SET sent_at=?,last_error=NULL WHERE id=?',
-                             (datetime.now(timezone.utc).isoformat(), row['id']))
+                conn.execute('UPDATE reminders SET sent_at=?,last_attempt_at=?,last_error=NULL WHERE id=?',
+                             (attempted_at, attempted_at, row['id']))
             sent += 1
         except (OSError, smtplib.SMTPException) as error:
             with connection() as conn:
-                conn.execute('UPDATE reminders SET last_error=? WHERE id=?', (str(error)[:200], row['id']))
+                conn.execute('UPDATE reminders SET last_error=?,last_attempt_at=? WHERE id=?',
+                             (str(error)[:200], attempted_at, row['id']))
     return sent
 
 

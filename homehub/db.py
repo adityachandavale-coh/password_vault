@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     document_id TEXT REFERENCES documents(id),
     sent_at TEXT,
     last_error TEXT,
+    last_attempt_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(send_on, sent_at);
@@ -70,10 +71,22 @@ CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(spent_on);
 """
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+# existing table untouched, so each one is added explicitly.
+ADDED_COLUMNS = (
+    ('reminders', 'last_attempt_at', 'TEXT'),
+)
+
+
 def initialize() -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.executescript(SCHEMA)
+        for table, column, definition in ADDED_COLUMNS:
+            existing = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+            if column not in existing:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+        conn.commit()
     finally:
         conn.close()
 
