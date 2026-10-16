@@ -1,0 +1,15 @@
+.venv/
+node_modules/
+.pnpm-store/
+dist/
+.env
+data/
+*.db
+*.db-*
+__pycache__/
+.pytest_cache/
+android/
+ios/
+reports/
+rclone/
+*.hhb
